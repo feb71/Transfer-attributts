@@ -1,1 +1,5 @@
-streamlit pandas numpy shapely openpyxl
+streamlit
+pandas
+numpy
+shapely
+openpyxl
