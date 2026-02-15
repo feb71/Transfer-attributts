@@ -26,24 +26,17 @@ def normalize_value(v, mode="trim_upper"):
     return s
 
 def forward_fill_group_ids(df, group_col):
-    # Gemini-Excel har ofte ID bare på første rad i hver gruppe.
-    # Fyll ned slik at alle rader har group_id.
     df[group_col] = df[group_col].ffill()
     return df
 
-def build_lines_from_points(df, group_col, order_col, x_col, y_col):
-    """
-    Returnerer:
-      - lines_df: én rad per gruppe med kolonnene [group_col, 'geometry']
-      - group_rows: dict[group_id] -> indeksliste i original df
-    """
+def build_lines_from_points(df, gid_col, order_col, x_col, y_col):
     df = df.copy()
-    df = df.sort_values([group_col, order_col], kind="mergesort")
+    df = df.sort_values([gid_col, order_col], kind="mergesort")
 
     group_rows = {}
     records = []
 
-    for gid, g in df.groupby(group_col, dropna=False):
+    for gid, g in df.groupby(gid_col, dropna=False):
         idxs = g.index.tolist()
         group_rows[gid] = idxs
 
@@ -55,24 +48,19 @@ def build_lines_from_points(df, group_col, order_col, x_col, y_col):
         if len(xs) < 2:
             geom = None
         else:
-            coords = list(zip(xs.tolist(), ys.tolist()))
-            geom = LineString(coords)
+            geom = LineString(list(zip(xs.tolist(), ys.tolist())))
 
-        records.append({group_col: gid, "geometry": geom, "n_points": int(len(xs))})
+        records.append({gid_col: gid, "geometry": geom, "n_points": int(len(xs))})
 
     lines_df = pd.DataFrame(records)
     lines_df = lines_df[lines_df["geometry"].notna()].reset_index(drop=True)
     return lines_df, group_rows
 
-def group_attributes(df, group_col, prefer_first_row=True):
-    """
-    Samler attributter per gruppe til én rad per group_id.
-    Fyller ned innen gruppe før vi tar representativ rad.
-    """
+def group_attributes(df, gid_col, prefer_first_row=True):
     d = df.copy()
-    d = d.groupby(group_col, dropna=False).apply(lambda g: g.ffill()).reset_index(drop=True)
-    rep = d.groupby(group_col, dropna=False).head(1).copy() if prefer_first_row else d.groupby(group_col, dropna=False).tail(1).copy()
-    return rep.set_index(group_col)
+    d = d.groupby(gid_col, dropna=False).apply(lambda g: g.ffill()).reset_index(drop=True)
+    rep = d.groupby(gid_col, dropna=False).head(1).copy() if prefer_first_row else d.groupby(gid_col, dropna=False).tail(1).copy()
+    return rep.set_index(gid_col)
 
 def sample_distances(meas_line, theo_line, n_samples=5):
     if meas_line is None or theo_line is None or meas_line.length == 0:
@@ -84,6 +72,7 @@ def sample_distances(meas_line, theo_line, n_samples=5):
     return ds
 
 def matches_required_fields(meas_attrs, theo_attrs, field_rules):
+    # All rules are MUST-match
     for rule in field_rules:
         col = rule["name"]
         mode = rule.get("mode", "trim_upper")
@@ -99,7 +88,7 @@ def pick_transfer_columns(theo_rep_df, exclude_cols, selection_mode, chosen_cols
         return cols
     return [c for c in chosen_cols if c in cols]
 
-def transfer_to_measured_rows(meas_df, meas_group_rows, meas_group_col, meas_gid, theo_row, transfer_cols, fill_all_rows=True):
+def transfer_to_measured_rows(meas_df, meas_group_rows, meas_gid, theo_row, transfer_cols, fill_all_rows=True):
     idxs = meas_group_rows.get(meas_gid, [])
     if not idxs:
         return meas_df
@@ -115,6 +104,20 @@ def transfer_to_measured_rows(meas_df, meas_group_rows, meas_group_col, meas_gid
         meas_df.loc[idxs[0], transfer_cols] = [theo_row.get(c, np.nan) for c in transfer_cols]
     return meas_df
 
+def restore_gemini_id_pattern(df, id_col, gid_col, order_col):
+    out = df.copy()
+    tmp = out[[gid_col, order_col]].copy()
+    tmp[order_col] = pd.to_numeric(tmp[order_col], errors="coerce")
+    first_idx = (
+        tmp.sort_values([gid_col, order_col], kind="mergesort")
+           .groupby(gid_col, dropna=False)
+           .head(1)
+           .index
+    )
+    mask_first = out.index.isin(first_idx)
+    out.loc[~mask_first, id_col] = np.nan
+    return out
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -127,29 +130,32 @@ with colA:
 with colB:
     meas_file = st.file_uploader("Innmålt datasett (Excel)", type=["xlsx"], key="meas")
 
-with st.expander("1) Kolonner og importvalg", expanded=True):
-    st.caption("Velg kolonnene som beskriver linjene (ID, rekkefølge, koordinater). Standardene under matcher typisk Gemini-eksport.")
+with st.expander("1) Kolonner og import/eksportvalg", expanded=True):
     group_col = st.text_input("Linje-ID kolonne", value="Id")
     order_col = st.text_input("Rekkefølge kolonne", value="Nr.")
     x_col = st.text_input("X (Øst) kolonne", value="Øst")
     y_col = st.text_input("Y (Nord) kolonne", value="Nord")
 
-    id_ffill = st.checkbox("Fyll ned tom ID (Id) automatisk (ffill)", value=True)
+    id_ffill = st.checkbox("Fyll ned tom ID (Id) automatisk (ffill) for matching", value=True)
+    output_id_first_only = st.checkbox("Skriv ID kun på første punkt per linje i output (Gemini-format)", value=True)
 
 with st.expander("2) Match-regler", expanded=True):
-    max_dist = st.number_input("Maks planavstand (meter) for kandidat (2D)", min_value=0.0, value=1.0, step=0.1)
+    max_dist = st.number_input("Bufferavstand (meter) (2D)", min_value=0.0, value=1.0, step=0.1)
     n_samples = st.slider("Antall snittpunkter langs innmålt linje", min_value=3, max_value=15, value=5, step=1)
-    min_hits = st.slider("Min. antall snittpunkter som må være ≤ maksavstand", min_value=1, max_value=15, value=3, step=1)
+    min_hits = st.slider("Min. antall snittpunkter som må være ≤ bufferavstand", min_value=1, max_value=15, value=3, step=1)
 
-    st.caption("Velg attributter som MÅ matche (f.eks. Type + Dimensjon). Verdier normaliseres før sammenligning.")
+    st.caption("Velg attributter som MÅ matche. **Viktig:** Disse feltene må finnes og være utfylt i BÅDE teoretisk og innmålt datasett.")
+    st.caption("Tips: For dimensjon, bruk normalisering 'digits_only' for å matche 'Ø160' mot '160 mm'.")
+
     default_rules = [{"name":"VEAS_VA.System","mode":"trim_upper"},{"name":"VEAS_VA.Dimensjon (mm)","mode":"digits_only"}]
     rules_df = st.session_state.get("rules_df", pd.DataFrame(default_rules))
+
     rules_df = st.data_editor(
         rules_df,
         num_rows="dynamic",
         use_container_width=True,
         column_config={
-            "name": st.column_config.TextColumn("Kolonnenavn", required=True),
+            "name": st.column_config.TextColumn("Kolonnenavn (må finnes i begge filer)", required=True),
             "mode": st.column_config.SelectboxColumn("Normalisering", options=["trim_upper","digits_only","raw"])
         },
         key="rules_editor"
@@ -159,7 +165,6 @@ with st.expander("2) Match-regler", expanded=True):
 with st.expander("3) Hvilke attributter skal overføres?", expanded=True):
     selection_mode = st.radio("Overfør:", ["Alle (unntatt ekskluderte)", "Utvalg"], horizontal=True)
     fill_all_rows = st.checkbox("Fyll verdiene på alle rader i samme linje (anbefalt)", value=True)
-    st.caption("Ekskluderes automatisk: geometri- og punktkolonner (ID, rekkefølge, X/Y og evt. andre tekniske felter kan legges til).")
     extra_exclude = st.text_input("Ekstra kolonner å ekskludere (kommaseparert)", value="Profilnr,Lengde,Lengde 3D,Element,Lukket")
     extra_exclude_cols = [c.strip() for c in extra_exclude.split(",") if c.strip()]
 
@@ -169,22 +174,41 @@ if run_btn:
     theo_df = pd.read_excel(theo_file)
     meas_df = pd.read_excel(meas_file)
 
+    # Fill down IDs for matching (internal)
     if id_ffill:
         if group_col in theo_df.columns: theo_df = forward_fill_group_ids(theo_df, group_col)
         if group_col in meas_df.columns: meas_df = forward_fill_group_ids(meas_df, group_col)
 
-    missing_cols = [c for c in [group_col, order_col, x_col, y_col] if c not in theo_df.columns or c not in meas_df.columns]
+    # Internal group id
+    gid_col = "__gid__"
+    if group_col not in theo_df.columns or group_col not in meas_df.columns:
+        st.error(f"Fant ikke ID-kolonnen '{group_col}' i begge filer.")
+        st.stop()
+
+    theo_df[gid_col] = theo_df[group_col]
+    meas_df[gid_col] = meas_df[group_col]
+
+    # Validate required geometry columns
+    needed = [gid_col, order_col, x_col, y_col]
+    missing_cols = [c for c in needed if c not in theo_df.columns or c not in meas_df.columns]
     if missing_cols:
         st.error(f"Mangler nødvendige kolonner i en av filene: {missing_cols}")
         st.stop()
 
-    theo_lines, theo_group_rows = build_lines_from_points(theo_df, group_col, order_col, x_col, y_col)
-    meas_lines, meas_group_rows = build_lines_from_points(meas_df, group_col, order_col, x_col, y_col)
+    # Validate match fields exist in BOTH
+    bad_rules = [r["name"] for r in field_rules if (r["name"] not in theo_df.columns or r["name"] not in meas_df.columns)]
+    if bad_rules:
+        st.error("Match-attributtene under finnes ikke i begge filer (eller heter ulikt). Fjern dem eller endre navn:\n\n- " + "\n- ".join(bad_rules))
+        st.stop()
 
-    theo_rep = group_attributes(theo_df, group_col, prefer_first_row=True)
-    meas_rep = group_attributes(meas_df, group_col, prefer_first_row=True)
+    theo_lines, theo_group_rows = build_lines_from_points(theo_df, gid_col, order_col, x_col, y_col)
+    meas_lines, meas_group_rows = build_lines_from_points(meas_df, gid_col, order_col, x_col, y_col)
 
-    exclude_cols = set([group_col, order_col, x_col, y_col, "geometry", "n_points"] + extra_exclude_cols)
+    theo_rep = group_attributes(theo_df, gid_col, prefer_first_row=True)
+    meas_rep = group_attributes(meas_df, gid_col, prefer_first_row=True)
+
+    # Choose transfer columns
+    exclude_cols = set([gid_col, group_col, order_col, x_col, y_col, "geometry", "n_points"] + extra_exclude_cols)
     all_theo_cols = [c for c in theo_rep.columns if c not in exclude_cols]
 
     chosen_cols = []
@@ -194,20 +218,19 @@ if run_btn:
             options=all_theo_cols,
             default=[c for c in all_theo_cols if c.startswith("VEAS_")]
         )
-
     transfer_cols = pick_transfer_columns(theo_rep, exclude_cols, selection_mode, chosen_cols)
 
     # Spatial index on theoretical geometries
     theo_geoms = theo_lines["geometry"].tolist()
-    theo_ids = theo_lines[group_col].tolist()
+    theo_ids = theo_lines[gid_col].tolist()
     tree = STRtree(theo_geoms)
-    geom_to_id = {id(g): gid for g, gid in zip(theo_geoms, theo_ids)}
+    geom_to_gid = {id(g): gid for g, gid in zip(theo_geoms, theo_ids)}
 
     meas_out = meas_df.copy()
     match_rows = []
 
     for _, m in meas_lines.iterrows():
-        mgid = m[group_col]
+        mgid = m[gid_col]
         mgeom = m["geometry"]
 
         if mgeom is None or mgeom.length == 0:
@@ -216,27 +239,29 @@ if run_btn:
 
         meas_attrs = meas_rep.loc[mgid].to_dict() if mgid in meas_rep.index else {}
 
-        # Expand bbox with max_dist to get candidates
-        minx, miny, maxx, maxy = mgeom.bounds
-        # Simple envelope for query
-        query_env = LineString([(minx-max_dist, miny-max_dist),(maxx+max_dist, maxy+max_dist)]).envelope
+        # IMPORTANT CHANGE: query candidates using a buffer around measured line (works regardless of line length)
+        query_geom = mgeom.buffer(max_dist)
+        candidates = tree.query(query_geom)
 
-        candidates = tree.query(query_env)
         best = None
 
         for tg in candidates:
-            tgid = geom_to_id.get(id(tg))
+            tgid = geom_to_gid.get(id(tg))
             if tgid is None:
                 continue
 
+            # 2D distance filter
             line_dist = float(mgeom.distance(tg))
             if line_dist > max_dist:
                 continue
 
             theo_attrs = theo_rep.loc[tgid].to_dict() if tgid in theo_rep.index else {}
+
+            # Must match selected fields
             if field_rules and not matches_required_fields(meas_attrs, theo_attrs, field_rules):
                 continue
 
+            # Multi-slice check along measured line
             dists = sample_distances(mgeom, tg, n_samples=n_samples)
             hits = sum(1 for d in dists if d <= max_dist)
             if hits < min_hits:
@@ -254,7 +279,7 @@ if run_btn:
 
         tgid = best["tgid"]
         theo_row = theo_rep.loc[tgid].to_dict() if tgid in theo_rep.index else {}
-        meas_out = transfer_to_measured_rows(meas_out, meas_group_rows, group_col, mgid, theo_row, transfer_cols, fill_all_rows=fill_all_rows)
+        meas_out = transfer_to_measured_rows(meas_out, meas_group_rows, mgid, theo_row, transfer_cols, fill_all_rows=fill_all_rows)
 
         match_rows.append({
             "meas_id": mgid,
@@ -266,6 +291,14 @@ if run_btn:
         })
 
     match_report = pd.DataFrame(match_rows)
+
+    # Restore Gemini-like ID output if requested
+    if output_id_first_only:
+        meas_out = restore_gemini_id_pattern(meas_out, id_col=group_col, gid_col=gid_col, order_col=order_col)
+
+    # Drop internal id
+    if gid_col in meas_out.columns:
+        meas_out = meas_out.drop(columns=[gid_col])
 
     st.subheader("Resultat")
     c1, c2, c3 = st.columns(3)
