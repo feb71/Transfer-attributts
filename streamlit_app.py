@@ -179,8 +179,21 @@ if run_btn:
     theo_rep = group_rep(theo_df, gid_col)
     meas_rep = group_rep(meas_df, gid_col)
 
-    exclude = {gid_col, id_col, order_col, x_col, y_col, id_col_m, order_col_m, x_col_m, y_col_m}
+    # --- IKKE OVERSKRIV INNMÅLT GEOMETRI / PUNKTDATA ---
+    protected_cols = {
+        "Id", "Nr.", "Øst", "Nord", "Høyde",
+        "Profilnr", "Lengde", "Lengde 3D"
+    }
+    
+    exclude = {
+        gid_col,
+        id_col, order_col, x_col, y_col,
+        id_col_m, order_col_m, x_col_m, y_col_m
+    }.union(protected_cols)
+    
     transfer_cols = [c for c in theo_rep.columns if c not in exclude]
+
+    
 
     theo_geoms = [g for _, g, _ in theo_lines]
     theo_ids = [gid for gid, _, _ in theo_lines]
