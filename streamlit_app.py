@@ -6,7 +6,7 @@ import difflib
 from shapely.geometry import LineString
 from shapely.strtree import STRtree
 
-st.set_page_config(page_title="VA-linje matcher (v9)", layout="wide")
+st.set_page_config(page_title="VA-linje matcher (v10)", layout="wide")
 
 
 # -----------------------------
@@ -61,7 +61,6 @@ def build_lines(df, gid_col, order_col, x_col, y_col):
 
 
 def group_rep(df, gid_col):
-    # Fill attributes down within each group so "first row" has all values (Gemini-style)
     d = df.copy()
     d = d.groupby(gid_col, dropna=False).apply(lambda g: g.ffill()).reset_index(drop=True)
     rep = d.groupby(gid_col, dropna=False).head(1).copy()
@@ -69,9 +68,6 @@ def group_rep(df, gid_col):
 
 
 def restore_gemini_id_pattern(df, id_col, gid_col, order_col):
-    """
-    Set Id only on the first point row for each line (Gemini export style).
-    """
     out = df.copy()
     tmp = out[[gid_col, order_col]].copy()
     tmp[order_col] = pd.to_numeric(tmp[order_col], errors="coerce")
@@ -87,11 +83,6 @@ def restore_gemini_id_pattern(df, id_col, gid_col, order_col):
 
 
 def strtree_candidates_as_indices(tree, query_geom, geom_id_to_idx):
-    """
-    Shapely 1: STRtree.query returns geometries
-    Shapely 2: STRtree.query may return indices (numpy ints)
-    Normalize to list[int] indices into original geometry list.
-    """
     q = tree.query(query_geom)
 
     if isinstance(q, (list, tuple, np.ndarray)) and len(q) > 0 and isinstance(q[0], (int, np.integer)):
@@ -106,9 +97,6 @@ def strtree_candidates_as_indices(tree, query_geom, geom_id_to_idx):
 
 
 def count_matching_pairs(meas_attrs, theo_attrs, rules, ignore_missing_in_measured=True):
-    """
-    rules: list of dicts {meas_col, theo_col, mode}
-    """
     match_count = 0
     for r in rules:
         mc = r["meas_col"]
@@ -126,17 +114,12 @@ def count_matching_pairs(meas_attrs, theo_attrs, rules, ignore_missing_in_measur
 
 
 def snitt_hits(measured_line: LineString, theoretical_line: LineString, max_dist: float, n_points: int) -> int:
-    """
-    Sample points along measured_line and count how many are within max_dist of theoretical_line.
-    Uses line.interpolate(distance_along_line).
-    """
     if n_points <= 0:
         return 0
     L = float(measured_line.length)
     if L <= 0:
         return 0
 
-    # Include interior points, but also allow endpoints by using fractions 0..1
     hits = 0
     for i in range(n_points):
         frac = 0.0 if n_points == 1 else (i / (n_points - 1))
@@ -149,7 +132,7 @@ def snitt_hits(measured_line: LineString, theoretical_line: LineString, max_dist
 # -----------------------------
 # UI
 # -----------------------------
-st.title("VA-linje matcher (v9): teoretisk → innmålt (Excel → Excel)")
+st.title("VA-linje matcher (v10): teoretisk → innmålt (Excel → Excel)")
 
 colA, colB = st.columns(2)
 with colA:
@@ -157,6 +140,7 @@ with colA:
 with colB:
     meas_file = st.file_uploader("Innmålt datasett (Excel)", type=["xlsx"], key="meas")
 
+# Match-regler (vises alltid)
 with st.expander("Match-regler", expanded=True):
     max_dist = st.number_input("Bufferavstand (meter) (2D)", min_value=0.0, value=1.0, step=0.1)
 
@@ -170,24 +154,24 @@ with st.expander("Match-regler", expanded=True):
 
 with st.expander("Overføring", expanded=True):
     st.write("Innmålt geometri/punktdata blir aldri endret.")
-
     protected_text = st.text_input(
         "Ekstra beskyttede kolonner (kommaseparert) – i tillegg til standard (Høyde/Øst/Nord/...)",
         value="",
     )
     extra_protected = [c.strip() for c in protected_text.split(",") if c.strip()]
 
-run_btn = st.button("Kjør matching", type="primary", disabled=(theo_file is None or meas_file is None))
+# Vi bygger opp “konfig” først, og kjører matching kun på knapp
+config_ready = False
+match_rules = []
+transfer_cols = []
+theo_df = meas_df = None
 
-
-# -----------------------------
-# Run
-# -----------------------------
-if run_btn:
+if theo_file is not None and meas_file is not None:
+    # Les filer (dette skjer på rerun også, men det er OK — det kjører raskt)
     theo_df = pd.read_excel(theo_file)
     meas_df = pd.read_excel(meas_file)
 
-    # Auto-detect key columns (both datasets)
+    # Detect base columns (for info + senere matching)
     id_col = detect_col(theo_df, ["Id", "ID", "id"])
     order_col = detect_col(theo_df, ["Nr.", "Nr", "NR", "nr", "PunktNr", "punktnr"])
     x_col = detect_col(theo_df, ["Øst", "Ost", "X", "E", "East"])
@@ -214,31 +198,28 @@ if run_btn:
         st.write("Teoretisk kolonner:", list(theo_df.columns))
         st.write("Innmålt kolonner:", list(meas_df.columns))
 
-    # Fill IDs down (Gemini-style)
-    theo_df = forward_fill(theo_df, id_col)
-    meas_df = forward_fill(meas_df, id_col_m)
-
-    gid_col = "__gid__"
-    theo_df[gid_col] = theo_df[id_col]
-    meas_df[gid_col] = meas_df[id_col_m]
-
-    # Build representatives (for attribute matching)
-    theo_rep = group_rep(theo_df, gid_col)
-    meas_rep = group_rep(meas_df, gid_col)
-
     # -----------------------------
-    # Attribute mapping UI (after reading files so we can list cols)
+    # Match-attributter (mapping) – FØR knappen
     # -----------------------------
-    st.subheader("Match-attributter (kolonnemapping)")
-    st.caption("Velg hvilke kolonner som skal sammenlignes. Målt og teoretisk kan ha ulike navn.")
+    st.subheader("1) Velg match-attributter (kolonnemapping)")
+    st.caption("Velg hvilke kolonner som skal sammenlignes. Innmålt og teoretisk kan ha ulike navn.")
 
-    meas_cols = [c for c in meas_df.columns]
-    theo_cols = [c for c in theo_df.columns]
+    meas_cols = list(meas_df.columns)
+    theo_cols = list(theo_df.columns)
 
+    # Default forslag (du kan endre i UI)
     default_rules = pd.DataFrame([
-        {"meas_col": "VEAS_VA.Type og Dimensjon", "theo_col": "VEAS_VA.Type og Dimensjon", "mode": "trim_upper"},
-        {"meas_col": "VEAS_VA.Dimensjon (mm)", "theo_col": "VEAS_VA.Dimensjon (mm)", "mode": "digits_only"},
+        {"meas_col": meas_cols[0], "theo_col": theo_cols[0], "mode": "trim_upper"},
     ])
+    # Hvis vi har “kjente” navn, prøv å foreslå bedre default
+    for cand in ["VEAS_VA.Type og Dimensjon", "VEAS_Felles.Dimensjon", "VEAS_VA.Dimensjon (mm)", "Dimensjon", "Type"]:
+        if cand in meas_cols:
+            default_rules.loc[0, "meas_col"] = cand
+            break
+    for cand in ["VEAS_VA.Type og Dimensjon", "VEAS_Felles.Dimensjon", "VEAS_VA.Dimensjon (mm)", "Dimensjon", "Type"]:
+        if cand in theo_cols:
+            default_rules.loc[0, "theo_col"] = cand
+            break
 
     rules_df = st.data_editor(
         default_rules,
@@ -249,34 +230,104 @@ if run_btn:
             "theo_col": st.column_config.SelectboxColumn("Teoretisk kolonne", options=theo_cols, required=True),
             "mode": st.column_config.SelectboxColumn("Normalisering", options=["trim_upper", "digits_only", "raw"], required=True),
         },
-        key="rules_editor_v9",
+        key="rules_editor_v10",
     )
 
     match_rules = rules_df.dropna(subset=["meas_col", "theo_col"]).to_dict(orient="records")
+
     if len(match_rules) == 0:
-        st.error("Legg til minst én match-regel (kolonnemapping).")
-        st.stop()
-
-    # Validate match fields exist + suggest closest names (should be safe due to selectboxes, but keep guard)
-    missing = []
-    for r in match_rules:
-        mc = str(r["meas_col"])
-        tc = str(r["theo_col"])
-        if mc not in meas_df.columns or tc not in theo_df.columns:
-            missing.append((mc, tc))
-
-    if missing:
-        msg = ["Noen match-felt finnes ikke i filene (uventet):\n"]
-        for mc, tc in missing:
-            msg.append(f"\n• Innmålt: {mc} / Teoretisk: {tc}")
-            msg.append(f"  - Nærmeste i innmålt:   {difflib.get_close_matches(mc, list(meas_df.columns), n=5, cutoff=0.6)}")
-            msg.append(f"  - Nærmeste i teoretisk: {difflib.get_close_matches(tc, list(theo_df.columns), n=5, cutoff=0.6)}")
-        st.error("\n".join(msg))
-        st.stop()
+        st.warning("Legg til minst én match-regel (kolonnemapping) før du kjører.")
+    else:
+        # ekstra guard (skal være unødvendig siden selectbox)
+        missing = []
+        for r in match_rules:
+            if r["meas_col"] not in meas_cols or r["theo_col"] not in theo_cols:
+                missing.append(r)
+        if missing:
+            st.error("Noen valgte match-felt finnes ikke i filene (uventet).")
+            st.stop()
 
     # -----------------------------
-    # Build line geometries
+    # Velg hvilke attributter som skal overføres – FØR knappen
     # -----------------------------
+    st.subheader("2) Velg hvilke attributter som skal overføres")
+
+    # Fill IDs down (Gemini-style) for representative rows later
+    theo_tmp = forward_fill(theo_df.copy(), id_col)
+    meas_tmp = forward_fill(meas_df.copy(), id_col_m)
+
+    gid_col = "__gid__"
+    theo_tmp[gid_col] = theo_tmp[id_col]
+    meas_tmp[gid_col] = meas_tmp[id_col_m]
+
+    theo_rep = group_rep(theo_tmp, gid_col)
+
+    protected_cols = {
+        "Id", "Nr.", "Øst", "Nord", "Høyde",
+        "Profilnr", "Lengde", "Lengde 3D",
+        "Z", "Kote", "NN2000", "Høyde (m)", "Kote (m)"
+    }.union(set(extra_protected))
+
+    exclude = {
+        gid_col,
+        id_col, order_col, x_col, y_col,
+        id_col_m, order_col_m, x_col_m, y_col_m,
+    }.union(protected_cols)
+
+    candidate_transfer_cols = sorted([c for c in theo_rep.columns if c not in exclude])
+
+    transfer_mode = st.radio("Overføring", options=["Alle", "Utvalg"], horizontal=True, key="transfer_mode_v10")
+
+    if transfer_mode == "Utvalg":
+        transfer_cols = st.multiselect(
+            "Velg kolonner fra teoretisk som skal kopieres til innmålt",
+            options=candidate_transfer_cols,
+            default=[c for c in candidate_transfer_cols if c.lower().startswith("veas")][:20],
+            key="transfer_cols_v10"
+        )
+    else:
+        transfer_cols = candidate_transfer_cols
+
+    if len(transfer_cols) == 0:
+        st.warning("Velg minst én kolonne å overføre (eller velg 'Alle').")
+
+    # Klar til kjøring når vi har minst én matchregel og minst én transfer-kolonne
+    config_ready = (len(match_rules) > 0) and (len(transfer_cols) > 0)
+
+else:
+    st.info("Last opp begge Excel-filene for å få valg av match-attributter og overføringskolonner.")
+
+
+# -----------------------------
+# Run button (only executes matching)
+# -----------------------------
+run_btn = st.button("Kjør matching", type="primary", disabled=not config_ready)
+
+if run_btn:
+    # Re-load cleanly from upload objects (safe)
+    theo_df = pd.read_excel(theo_file)
+    meas_df = pd.read_excel(meas_file)
+
+    # Detect base columns again
+    id_col = detect_col(theo_df, ["Id", "ID", "id"])
+    order_col = detect_col(theo_df, ["Nr.", "Nr", "NR", "nr", "PunktNr", "punktnr"])
+    x_col = detect_col(theo_df, ["Øst", "Ost", "X", "E", "East"])
+    y_col = detect_col(theo_df, ["Nord", "Y", "N", "North"])
+
+    id_col_m = detect_col(meas_df, ["Id", "ID", "id"])
+    order_col_m = detect_col(meas_df, ["Nr.", "Nr", "NR", "nr", "PunktNr", "punktnr"])
+    x_col_m = detect_col(meas_df, ["Øst", "Ost", "X", "E", "East"])
+    y_col_m = detect_col(meas_df, ["Nord", "Y", "N", "North"])
+
+    # Force Gemini pattern -> ffill IDs
+    theo_df = forward_fill(theo_df, id_col)
+    meas_df = forward_fill(meas_df, id_col_m)
+
+    gid_col = "__gid__"
+    theo_df[gid_col] = theo_df[id_col]
+    meas_df[gid_col] = meas_df[id_col_m]
+
+    # Build lines
     theo_lines, theo_group_rows = build_lines(theo_df, gid_col, order_col, x_col, y_col)
     meas_lines, meas_group_rows = build_lines(meas_df, gid_col, order_col_m, x_col_m, y_col_m)
 
@@ -286,46 +337,10 @@ if run_btn:
         st.error("Ingen linjer kunne bygges (sjekk at hver linje har minst 2 punkt med X/Y).")
         st.stop()
 
-    # -----------------------------
-    # Transfer selection
-    # -----------------------------
-    protected_cols = {
-        "Id", "Nr.", "Øst", "Nord", "Høyde",
-        "Profilnr", "Lengde", "Lengde 3D",
-        "Z", "Kote", "NN2000", "Høyde (m)", "Kote (m)"
-    }
-    protected_cols |= set(extra_protected)
+    theo_rep = group_rep(theo_df, gid_col)
+    meas_rep = group_rep(meas_df, gid_col)
 
-    exclude = {
-        gid_col,
-        id_col, order_col, x_col, y_col,
-        id_col_m, order_col_m, x_col_m, y_col_m,
-    }.union(protected_cols)
-
-    # Candidate transfer columns from theoretical (safe)
-    candidate_transfer_cols = [c for c in theo_rep.columns if c not in exclude]
-    candidate_transfer_cols_sorted = sorted(candidate_transfer_cols)
-
-    st.subheader("Velg hvilke attributter som skal overføres")
-    transfer_mode = st.radio("Overføring", options=["Alle", "Utvalg"], horizontal=True)
-
-    if transfer_mode == "Utvalg":
-        selected_transfer_cols = st.multiselect(
-            "Velg kolonner fra teoretisk som skal kopieres til innmålt",
-            options=candidate_transfer_cols_sorted,
-            default=[c for c in candidate_transfer_cols_sorted if c.lower().startswith("veas")][:20],
-        )
-        transfer_cols = selected_transfer_cols
-    else:
-        transfer_cols = candidate_transfer_cols_sorted
-
-    if len(transfer_cols) == 0:
-        st.error("Du må velge minst én kolonne å overføre (eller velg 'Alle').")
-        st.stop()
-
-    # -----------------------------
-    # Spatial index (theoretical)
-    # -----------------------------
+    # Spatial index on theoretical lines
     theo_geoms = [g for _, g, _ in theo_lines]
     theo_ids = [gid for gid, _, _ in theo_lines]
     tree = STRtree(theo_geoms)
@@ -337,9 +352,7 @@ if run_btn:
     for mgid, mgeom, _ in meas_lines:
         meas_attrs = meas_rep.loc[mgid].to_dict() if mgid in meas_rep.index else {}
 
-        # Buffer polygon around measured line
         buf = mgeom.buffer(max_dist)
-
         cand_idxs = strtree_candidates_as_indices(tree, buf, geom_id_to_idx)
 
         best = None
@@ -347,28 +360,24 @@ if run_btn:
             tgid = theo_ids[idx]
             tgeom = theo_geoms[idx]
 
-            # Distance safety check
             d = float(mgeom.distance(tgeom))
             if d > max_dist:
                 continue
 
             theo_attrs = theo_rep.loc[tgid].to_dict() if tgid in theo_rep.index else {}
 
-            # Attribute match count (mapping)
             mcount = count_matching_pairs(
                 meas_attrs, theo_attrs, match_rules, ignore_missing_in_measured=ignore_missing
             )
             if mcount < min_attr_matches:
                 continue
 
-            # Snitt/hits check
             hits = None
             if use_snitt:
                 hits = snitt_hits(mgeom, tgeom, max_dist, int(snitt_n))
                 if hits < int(snitt_min_hits):
                     continue
 
-            # Score: closest first; tie-breaker: more attr matches; then more hits (if used)
             score = (d, -mcount, -(hits if hits is not None else 0))
             if best is None or score < best["score"]:
                 best = {"tgid": tgid, "d": d, "mcount": mcount, "hits": hits, "score": score}
@@ -387,7 +396,6 @@ if run_btn:
         tgid = best["tgid"]
         theo_row = theo_rep.loc[tgid].to_dict()
 
-        # Transfer attributes to ALL points on measured line (but only selected safe columns)
         idxs = meas_group_rows.get(mgid, [])
         for col in transfer_cols:
             if col not in meas_out.columns:
@@ -405,7 +413,6 @@ if run_btn:
 
     match_report = pd.DataFrame(match_rows)
 
-    # Restore Gemini ID output (Id only on first point per line)
     if output_id_first_only:
         meas_out = restore_gemini_id_pattern(meas_out, id_col=id_col_m, gid_col=gid_col, order_col=order_col_m)
 
@@ -416,10 +423,8 @@ if run_btn:
     c1.metric("Innmålte linjer", int(len(meas_lines)))
     c2.metric("Matchet", int((match_report["status"] == "matched").sum()))
     c3.metric("Ikke matchet", int((match_report["status"] != "matched").sum()))
-
     st.dataframe(match_report, use_container_width=True)
 
-    # Export
     import io
     out_buf = io.BytesIO()
     with pd.ExcelWriter(out_buf, engine="openpyxl") as writer:
