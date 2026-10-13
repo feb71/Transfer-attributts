@@ -413,8 +413,17 @@ if run_btn:
         idxs = meas_group_rows.get(mgid, [])
         for col in transfer_cols:
             if col not in meas_out.columns:
-                meas_out[col] = np.nan
-            meas_out.loc[idxs, col] = theo_row.get(col, np.nan)
+                meas_out[col] = pd.Series(
+                    np.nan,
+                    index=meas_out.index,
+                    dtype="object"
+            )
+        else:
+            # Tillat overføring av tekst, tall, datoer og tomme verdier
+            meas_out[col] = meas_out[col].astype("object")
+    
+        value = theo_row.get(col, np.nan)
+        meas_out.loc[idxs, col] = value
 
         match_rows.append({
             "meas_id": mgid,
