@@ -62,10 +62,24 @@ def build_lines(df, gid_col, order_col, x_col, y_col):
 
 def group_rep(df, gid_col):
     d = df.copy()
-    d = d.groupby(gid_col, dropna=False).apply(lambda g: g.ffill()).reset_index(drop=True)
-    rep = d.groupby(gid_col, dropna=False).head(1).copy()
-    return rep.set_index(gid_col)
 
+    # Forward-fill alle kolonner innen hver gruppe,
+    # men behold selve gruppekolonnen
+    value_cols = [c for c in d.columns if c != gid_col]
+
+    for col in value_cols:
+        d[col] = d.groupby(
+            gid_col,
+            dropna=False,
+            sort=False
+        )[col].ffill()
+
+    rep = d.drop_duplicates(
+        subset=[gid_col],
+        keep="first"
+    ).copy()
+
+    return rep.set_index(gid_col)
 
 def restore_gemini_id_pattern(df, id_col, gid_col, order_col):
     out = df.copy()
