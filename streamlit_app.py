@@ -533,9 +533,32 @@ if run_btn:
 
         # Viktig: denne løkken inkluderer både datatypehåndtering og selve
         # skrivingen. Da blir alle valgte kolonner overført, ikke bare den siste.
+        # Legg teoretiske verdier inn i samme kolonner.
+        # Eksisterende innmålte verdier skal beholdes; bare tomme celler fylles.
         for column in transfer_cols:
             value = theoretical_row.get(column, np.nan)
             meas_out.loc[measured_indexes, column] = value
+
+            # En tom teoretisk verdi skal aldri overskrive eller fylle noe.
+            if value is None or pd.isna(value):
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+
+            current_values = meas_out.loc[measured_indexes, column]
+
+            blank = current_values.map(
+                lambda current: (
+                    current is None
+                    or pd.isna(current)
+                    or (isinstance(current, str) and not current.strip())
+                )
+            )
+
+            meas_out.loc[measured_indexes, column] = current_values.mask(
+                blank,
+                value,
+            )
 
         match_rows.append(
             {
