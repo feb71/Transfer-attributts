@@ -434,6 +434,8 @@ if run_btn:
     tree = STRtree(theoretical_geometries)
 
     meas_out = meas_df.copy()
+    meas_out = meas_df.copy(deep=True)
+    original_measured = meas_df.copy(deep=True)
 
     # Pandas 2.2+ tillater ikke alltid tekst/tall/dato i en eksisterende
     # numerisk kolonne. Gjør overføringskolonnene fleksible før skriving.
@@ -570,6 +572,19 @@ if run_btn:
                 "snitt_hits": None if not use_snitt else int(best["hits"]),
             }
         )
+
+    # Sikkerhetsnett: ingen opprinnelige, ikke-tomme innmålte verdier
+    # skal kunne bli overskrevet av overføringen.
+    for column in original_measured.columns:
+        original_values = original_measured[column]
+        keep_original = original_values.map(
+            lambda value: not (
+                value is None
+                or pd.isna(value)
+                or (isinstance(value, str) and not value.strip())
+            )
+        )
+        meas_out.loc[keep_original, column] = original_values.loc[keep_original]
 
     match_report = pd.DataFrame(match_rows)
 
