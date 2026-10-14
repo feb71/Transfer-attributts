@@ -127,6 +127,16 @@ def interpolate_3d_at_distance(points, distance):
     return points[segment] + ratio * (points[segment + 1] - points[segment])
 
 
+def fractions_for_spacing(points, spacing):
+    """Create normalized sample positions at approximately fixed spacing."""
+    xy = points[:, :2]
+    length = float(np.sum(np.linalg.norm(np.diff(xy, axis=0), axis=1)))
+    if length <= 0 or spacing <= 0:
+        return np.array([0.0, 1.0])
+    count = max(2, int(np.ceil(length / spacing)) + 1)
+    return np.linspace(0.0, 1.0, count)
+
+
 def compare_reference_to_target(reference_points, target_xy, target_points, fractions):
     """Compare sampled reference points with nearest positions on target line."""
     reference_samples = interpolate_3d(reference_points, fractions)
@@ -216,6 +226,12 @@ with st.expander("3D-matchinnstillinger", expanded=True):
     vertical_limit = st.number_input("Maks høydeforskjell (m)", min_value=0.0, value=0.5, step=0.05)
     max_3d_limit = st.number_input("Maks samlet 3D-avstand (m)", min_value=0.0, value=1.0, step=0.05)
     sample_count = st.number_input("Antall interpolerte kontrollpunkter per linje", min_value=2, value=11, step=1)
+    control_spacing = st.number_input(
+        "Avstand mellom kontrollpunkter (m)",
+        min_value=0.01,
+        value=1.0,
+        step=0.1,
+    )
     min_valid_samples = st.slider("Minimum andel godkjente kontrollpunkter", 0.0, 1.0, 0.7, 0.05)
     min_attr_matches = st.slider("Minimum matchende attributter", 0, 10, 1)
     ignore_missing = st.checkbox("Ignorer tomt matchfelt i innmålt", value=True)
@@ -342,6 +358,14 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
             valid_fraction = score[0] / len(fractions)
             # Test begge retninger. Dette gjør at en kort innmålt del kan
             # matche en lang teoretisk linje, og omvendt.
+            theoretical_fractions = fractions_for_spacing(
+                theoretical_points,
+                control_spacing,
+            )
+            measured_fractions = fractions_for_spacing(
+                measured["points"],
+                control_spacing,
+            )
             comparisons = [
                 (
                     "teoretisk_til_innmålt",
@@ -349,7 +373,7 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
                         theoretical_points,
                         measured["xy"],
                         measured["points"],
-                        fractions,
+                        theoretical_fractions,
                     ),
                 ),
                 (
@@ -358,7 +382,7 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
                         measured["points"],
                         theoretical["xy"],
                         theoretical_points,
-                        fractions,
+                        measured_fractions,
                     ),
                 ),
             ]
