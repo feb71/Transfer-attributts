@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 from shapely.strtree import STRtree
 
 
@@ -108,6 +109,64 @@ def interpolate_3d(points, fractions):
     return np.asarray(result)
 
 
+def interpolate_3d_at_distance(points, distance):
+    """Return the 3D point at a 2D distance along a point sequence."""
+    xy = points[:, :2]
+    segment_lengths = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    total = cumulative[-1]
+
+    if total <= 0:
+        return points[0].copy()
+
+    target = float(np.clip(distance, 0.0, total))
+    segment = int(np.searchsorted(cumulative, target, side="right") - 1)
+    segment = max(0, min(segment, len(points) - 2))
+    length = cumulative[segment + 1] - cumulative[segment]
+    ratio = 0.0 if length <= 0 else (target - cumulative[segment]) / length
+    return points[segment] + ratio * (points[segment + 1] - points[segment])
+
+
+def compare_reference_to_target(reference_points, target_xy, target_points, fractions):
+    """Compare sampled reference points with nearest positions on target line."""
+    reference_samples = interpolate_3d(reference_points, fractions)
+    nearest_target_samples = []
+
+    for reference_sample in reference_samples:
+        target_distance = target_xy.project(
+            Point(float(reference_sample[0]), float(reference_sample[1]))
+        )
+        nearest_target_samples.append(
+            interpolate_3d_at_distance(target_points, target_distance)
+        )
+
+    nearest_target_samples = np.asarray(nearest_target_samples)
+    horizontal = np.linalg.norm(
+        nearest_target_samples[:, :2] - reference_samples[:, :2],
+        axis=1,
+    )
+    vertical = np.abs(nearest_target_samples[:, 2] - reference_samples[:, 2])
+    distance_3d = np.sqrt(horizontal**2 + vertical**2)
+    valid = (
+        (horizontal <= horizontal_limit)
+        & (vertical <= vertical_limit)
+        & (distance_3d <= max_3d_limit)
+    )
+
+    score = (
+        int(valid.sum()),
+        -float(np.nanmax(distance_3d)),
+        -float(np.nanmean(distance_3d)),
+    )
+    return {
+        "score": score,
+        "horizontal": horizontal,
+        "vertical": vertical,
+        "distance_3d": distance_3d,
+        "valid_fraction": score[0] / len(fractions),
+    }
+
+
 def match_attributes(measured, theoretical, rules, ignore_missing):
     count = 0
     for rule in rules:
@@ -144,6 +203,7 @@ def restore_original_values(output, original):
 
 st.title("VA-linje 3D-matcher: teoretisk → innmålt")
 st.caption("Separat eksperimentell versjon. Den eksisterende 2D-appen endres ikke.")
+st.caption("Separat eksperimentell versjon. Den eksisterende 2D-appen endres ikke. Matchingen testes i begge retninger.")
 
 left, right = st.columns(2)
 with left:
@@ -280,6 +340,34 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
             valid = (horizontal <= horizontal_limit) & (vertical <= vertical_limit) & (distance_3d <= max_3d_limit)
             score = (int(valid.sum()), float(np.nanmax(distance_3d)), float(np.nanmean(distance_3d)))
             valid_fraction = score[0] / len(fractions)
+            # Test begge retninger. Dette gjør at en kort innmålt del kan
+            # matche en lang teoretisk linje, og omvendt.
+            comparisons = [
+                (
+                    "teoretisk_til_innmålt",
+                    compare_reference_to_target(
+                        theoretical_points,
+                        measured["xy"],
+                        measured["points"],
+                        fractions,
+                    ),
+                ),
+                (
+                    "innmålt_til_teoretisk",
+                    compare_reference_to_target(
+                        measured["points"],
+                        theoretical["xy"],
+                        theoretical_points,
+                        fractions,
+                    ),
+                ),
+            ]
+            direction, comparison = max(comparisons, key=lambda item: item[1]["score"])
+            horizontal = comparison["horizontal"]
+            vertical = comparison["vertical"]
+            distance_3d = comparison["distance_3d"]
+            score = comparison["score"]
+            valid_fraction = comparison["valid_fraction"]
             best_valid_fraction = max(best_valid_fraction, valid_fraction)
 
             if best_max_horizontal is None or float(np.max(horizontal)) < best_max_horizontal:
@@ -294,6 +382,15 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
                 continue
             if best is None or score > best["score"]:
                 best = {"line": theoretical, "score": score, "horizontal": horizontal, "vertical": vertical, "distance_3d": distance_3d, "attrs": attrs}
+                best = {
+                    "line": theoretical,
+                    "score": score,
+                    "horizontal": horizontal,
+                    "vertical": vertical,
+                    "distance_3d": distance_3d,
+                    "attrs": attrs,
+                    "direction": direction,
+                }
 
         indexes = measured_groups.get(measured_gid, [])
         if best is None:
@@ -334,6 +431,7 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
             "meas_id": measured_gid,
             "status": "matched",
             "reason": "OK",
+            "comparison_direction": best["direction"],
             "theo_id": best["line"]["gid"],
             "attr_matches": best["attrs"],
             "godkjente_punkter": best["score"][0],
