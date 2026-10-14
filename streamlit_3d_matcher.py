@@ -256,6 +256,12 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
             candidate_ids = list(range(len(theo_lines)))
 
         best = None
+        attribute_rejections = 0
+        geometry_rejections = 0
+        best_valid_fraction = 0.0
+        best_max_horizontal = None
+        best_max_vertical = None
+        best_max_3d = None
         measured_samples = interpolate_3d(measured["points"], fractions)
 
         for candidate_index in candidate_ids:
@@ -263,6 +269,7 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
             theoretical_rep = theo_rep.loc[theoretical["gid"]].to_dict()
             attrs = match_attributes(measured_rep, theoretical_rep, match_rules, ignore_missing)
             if attrs < min_attr_matches:
+                attribute_rejections += 1
                 continue
 
             theoretical_points = orient_theoretical(measured["points"], theoretical["points"])
@@ -272,15 +279,46 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
             distance_3d = np.sqrt(horizontal**2 + vertical**2)
             valid = (horizontal <= horizontal_limit) & (vertical <= vertical_limit) & (distance_3d <= max_3d_limit)
             score = (int(valid.sum()), float(np.nanmax(distance_3d)), float(np.nanmean(distance_3d)))
+            valid_fraction = score[0] / len(fractions)
+            best_valid_fraction = max(best_valid_fraction, valid_fraction)
 
-            if score[0] / len(fractions) < min_valid_samples:
+            if best_max_horizontal is None or float(np.max(horizontal)) < best_max_horizontal:
+                best_max_horizontal = float(np.max(horizontal))
+            if best_max_vertical is None or float(np.max(vertical)) < best_max_vertical:
+                best_max_vertical = float(np.max(vertical))
+            if best_max_3d is None or float(np.max(distance_3d)) < best_max_3d:
+                best_max_3d = float(np.max(distance_3d))
+
+            if valid_fraction < min_valid_samples:
+                geometry_rejections += 1
                 continue
             if best is None or score > best["score"]:
                 best = {"line": theoretical, "score": score, "horizontal": horizontal, "vertical": vertical, "distance_3d": distance_3d, "attrs": attrs}
 
         indexes = measured_groups.get(measured_gid, [])
         if best is None:
-            rows.append({"meas_id": measured_gid, "status": "no_match", "theo_id": None})
+            if not candidate_ids:
+                reason = "Ingen teoretiske linjer tilgjengelig"
+            elif attribute_rejections == len(candidate_ids):
+                reason = "Match-attributtene stemmer ikke"
+            elif geometry_rejections > 0:
+                reason = (
+                    "Geometrien overskrider 3D-grensene "
+                    f"(beste godkjente andel: {best_valid_fraction:.0%})"
+                )
+            else:
+                reason = "Ingen kandidat oppfylte alle matchkrav"
+
+            rows.append({
+                "meas_id": measured_gid,
+                "status": "no_match",
+                "reason": reason,
+                "theo_id": None,
+                "best_valid_fraction": best_valid_fraction,
+                "best_max_horizontal": best_max_horizontal,
+                "best_max_vertical": best_max_vertical,
+                "best_max_3d": best_max_3d,
+            })
             continue
 
         theoretical_row = theo_rep.loc[best["line"]["gid"]].to_dict()
@@ -295,6 +333,7 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
         rows.append({
             "meas_id": measured_gid,
             "status": "matched",
+            "reason": "OK",
             "theo_id": best["line"]["gid"],
             "attr_matches": best["attrs"],
             "godkjente_punkter": best["score"][0],
