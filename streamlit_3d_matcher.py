@@ -4,6 +4,7 @@ import re
 import numpy as np
 import pandas as pd
 import streamlit as st
+from shapely.geometry import LineString
 from shapely.geometry import LineString, Point
 from shapely.strtree import STRtree
 
@@ -210,6 +211,8 @@ def restore_original_values(output, original):
     return output
 
 
+st.title("VA-linje 3D-matcher: teoretisk → innmålt")
+st.caption("Separat eksperimentell versjon. Den eksisterende 2D-appen endres ikke.")
 st.title("VA-linje 3D-matcher v2")
 st.caption("NY FIL – intervallbaserte kontrollpunkter og matching i begge retninger")
 
@@ -223,6 +226,7 @@ with st.expander("3D-matchinnstillinger", expanded=True):
     horizontal_limit = st.number_input("Maks horisontal avstand (m)", min_value=0.0, value=1.0, step=0.01)
     vertical_limit = st.number_input("Maks høydeforskjell (m)", min_value=0.0, value=0.5, step=0.05)
     max_3d_limit = st.number_input("Maks samlet 3D-avstand (m)", min_value=0.0, value=1.0, step=0.05)
+    sample_count = st.number_input("Antall interpolerte kontrollpunkter per linje", min_value=2, value=11, step=1)
     control_spacing = st.number_input(
         "Avstand mellom kontrollpunkter (m)",
         min_value=0.01,
@@ -292,6 +296,7 @@ else:
 if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
     theo_df = pd.read_excel(theo_file)
     meas_df = pd.read_excel(meas_file)
+    original_measured_input = meas_df.copy(deep=True)
 
     # Bare linje-ID skal fylles ned. Andre attributter skal ikke fylles
     # ned på tvers av punkter, fordi det kan endre de opprinnelige verdiene.
@@ -311,6 +316,7 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
     tree = STRtree(geoms)
     output = meas_df.copy(deep=True)
     original = meas_df.copy(deep=True)
+    original = original_measured_input.copy(deep=True)
 
     for column in transfer_cols:
         if column not in output.columns:
@@ -319,6 +325,8 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
             output[column] = output[column].astype("object")
 
     rows = []
+    fractions = np.linspace(0.0, 1.0, int(sample_count))
+
     for measured in meas_lines:
         measured_gid = measured["gid"]
         measured_rep = meas_rep.loc[measured_gid].to_dict()
@@ -333,6 +341,7 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
         best_max_horizontal = None
         best_max_vertical = None
         best_max_3d = None
+        measured_samples = interpolate_3d(measured["points"], fractions)
 
         for candidate_index in candidate_ids:
             theoretical = theo_lines[int(candidate_index)]
@@ -343,6 +352,13 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
                 continue
 
             theoretical_points = orient_theoretical(measured["points"], theoretical["points"])
+            theoretical_samples = interpolate_3d(theoretical_points, fractions)
+            horizontal = np.linalg.norm(measured_samples[:, :2] - theoretical_samples[:, :2], axis=1)
+            vertical = np.abs(measured_samples[:, 2] - theoretical_samples[:, 2])
+            distance_3d = np.sqrt(horizontal**2 + vertical**2)
+            valid = (horizontal <= horizontal_limit) & (vertical <= vertical_limit) & (distance_3d <= max_3d_limit)
+            score = (int(valid.sum()), float(np.nanmax(distance_3d)), float(np.nanmean(distance_3d)))
+            valid_fraction = score[0] / len(fractions)
             # Test begge retninger. Dette gjør at en kort innmålt del kan
             # matche en lang teoretisk linje, og omvendt.
             theoretical_fractions = fractions_for_spacing(
@@ -392,6 +408,7 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
                 geometry_rejections += 1
                 continue
             if best is None or score > best["score"]:
+                best = {"line": theoretical, "score": score, "horizontal": horizontal, "vertical": vertical, "distance_3d": distance_3d, "attrs": attrs}
                 best = {
                     "line": theoretical,
                     "score": score,
@@ -451,6 +468,11 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
         })
 
     output = restore_original_values(output, original)
+
+    # Gemini-format: behold nøyaktig opprinnelig ID-struktur.
+    # Internt fylles Id ned for gruppering, men i output skal ID normalt
+    # bare stå på første punkt i hver linje.
+    output[id_col_m] = original[id_col_m]
     output = output.drop(columns=[gid], errors="ignore")
     report = pd.DataFrame(rows)
 
@@ -463,6 +485,7 @@ if st.button("Kjør 3D-matching", type="primary", disabled=not config_ready):
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         output.to_excel(writer, index=False, sheet_name="innmalt_3d_attrib")
         report.to_excel(writer, index=False, sheet_name="match_report_3d")
+        original.to_excel(writer, index=False, sheet_name="original_innmalt")
 
     st.download_button(
         "Last ned 3D-resultat (Excel)",
